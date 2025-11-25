@@ -1,156 +1,115 @@
 #![allow(warnings)]
 
-use std::sync::atomic::{AtomicBool,Ordering};
-use std::{io::Cursor, process::Command, sync::Arc};
-use std::env;
-use futures_util::StreamExt;
-use std::sync::Mutex;
-use bytes::{Bytes, BytesMut, buf};
-
-use symphonia::core::{
-    audio::{AudioBufferRef, SampleBuffer, SignalSpec},
-    codecs::{DecoderOptions, CODEC_TYPE_NULL},
-    formats::{FormatOptions, FormatReader},
-    io::{MediaSourceStream, ReadBytes},
-    probe::Hint,
-};
+use std::array::from_fn;
+use std::collections::VecDeque;
+use std::io::SeekFrom;
+use std::sync::{Arc,Mutex};
+use std::{env, io::Seek};
+use std::process::Command;
+use std::time::Instant;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use futures_util::{StreamExt, io};
+use symphonia::core::audio::{SampleBuffer, Signal, SignalSpec};
+use symphonia::core::{
+    codecs:: {CODEC_TYPE_NULL, DecoderOptions},
+    formats::{FormatOptions},
+    io::{MediaSourceStream},
+    probe::{Hint},
+    errors::Error,
+};
+
 
 struct StreamingReader {
-    buffer: Arc<Mutex<BytesMut>>,
+    buffer: Vec<u8>,
     position: usize,
-    download_complete: Arc<AtomicBool>
 }
 
 impl StreamingReader {
-    fn new(buffer: Arc<Mutex<BytesMut>>,download_complete: Arc<AtomicBool>) -> Self {
-        return Self { buffer, position: 0, download_complete}
+    fn new() -> Self {
+        let buffer: Vec<u8> = Vec::new();
+        return Self {
+            buffer: buffer,
+            position: 0,
+        }
     }
 }
-
+//
 impl std::io::Read for StreamingReader {
-    fn read(&mut self,buf: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            let buffer = self.buffer.lock().unwrap();
-
-            if self.position >= buffer.len() {
-                if self.download_complete.load(Ordering::Relaxed) {
-                    return Ok(0);
-                } else {
-                    drop(buffer);
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    continue;
-                }
-            }
-            let available = buffer.len() - self.position;
-            let left_to_read = buf.len().min(available);
-
-            buf[..left_to_read].copy_from_slice(&buffer[self.position..self.position + left_to_read]);
-            self.position += left_to_read;
-            return Ok(left_to_read);
+    fn read(&mut self,buf: &mut[u8]) -> std::io::Result<usize> {
+        if self.position >= self.buffer.len() {
+            return Ok(0);
         }
+        let remaining = self.buffer.len() - self.position;
+        let to_read = remaining.min(buf.len());
+        buf[..to_read].copy_from_slice(&self.buffer[self.position..self.position + to_read]);
+        self.position += to_read;
+        return Ok(to_read);
     }
 }
 
 impl std::io::Seek for StreamingReader {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         match pos {
-            std::io::SeekFrom::Start(offset) => {
+            SeekFrom::Start(offset) => {
+                if offset > self.buffer.len() as u64 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "Seek out of bounds"));
+                }
                 self.position = offset as usize;
                 return Ok(self.position as u64);
             }
-            std::io::SeekFrom::Current(offset) => {
-                self.position = (self.position as i64 + offset) as usize;
+            SeekFrom::Current(offset) => {
+                let position = self.position as i64 + offset as i64;
+                if position < 0 || position > self.buffer.len() as i64 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "Seek out of bounds"));
+                }
+                self.position = position as usize;
                 return Ok(self.position as u64);
             }
-            std::io::SeekFrom::End(offset) => {
-                let buffer = self.buffer.lock().expect("\x1b[91mCouldnt Get Mutex Lock On Buffer");
-                self.position = (buffer.len() as i64 + offset) as usize;
+            SeekFrom::End(offset)=> {
+                let position = self.buffer.len() as i64 + offset as i64;
+                if position < 0 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "Seek out of bounds"));
+                }
+                self.position = position as usize;
                 return Ok(self.position as u64);
             }
         }
     }
 }
 
-impl symphonia::core::io::MediaSource for StreamingReader{
+impl symphonia::core::io::MediaSource for StreamingReader {
     fn is_seekable(&self) -> bool {
         return true;
     }
 
     fn byte_len(&self) -> Option<u64> {
-        let buf = self.buffer.lock().expect("\x1b[91mCouldnt Get Mutex Lock On Buffer");
-        return Some(buf.len() as u64);
+        return Some(self.buffer.len() as u64);
     }
 }
 
-async fn stream(response: reqwest::Response) -> Result<(),Box<dyn std::error::Error>> {
-    let buffer = Arc::new(Mutex::new(BytesMut::new()));
-    let buffer_clone = buffer.clone();
-    let download_complete = Arc::new(AtomicBool::new(false));
-    let download_complete_clone = download_complete.clone();
-    let handle = tokio::spawn(async move {
-        let mut stream = response.bytes_stream();
-        let mut chunk_count: u16 = 0;
+async fn stream(reader: StreamingReader) -> Result<(),Box<dyn std::error::Error>>{
 
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(chunk) => {
-                    let buf_len = {
-                        let mut buf = buffer_clone.lock().unwrap();
-                        buf.extend_from_slice(&chunk);
-                        buf.len()
-                    };
-                    chunk_count += 1;
-                    // if chunk_count % 10 == 0 {
-                    //     println!("\x1b[93mChunk Count: {}, Total: {} KB\x1b[0m", 
-                    //         chunk_count, buf_len / 1024);
-                    // }
-                }
-                Err(e) =>  {
-                    eprintln!("\x1b[91mChunk Failed: {}\x1b[0m", e);
-                    break;
-                }
-            }
-        }
-        download_complete_clone.store(true, Ordering::Relaxed);
-        println!("\x1b[93mFinished fetching all chunks\x1b[0m");
-    });
-    println!("\x1b[93mBuffering...\x1b[0m");
-
-    loop {
-        let buf_len = {
-            let buf = buffer.lock().unwrap();
-            buf.len()
-        };
-
-        if buf_len >= 1 * 1024 * 1024 {
-            println!("\x1b[96mBuffered {} KB\x1b[0m", buf_len / 1024);
-            break;
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    }
-
-    {
-        let buf = buffer.lock().expect("\x1b[91mCouldnt Get Mutex Lock On Buffer");
-        println!("\x1b[96mBuffer size: {} bytes\x1b[0m", buf.len());
-    }
-
-    let reader = StreamingReader::new(buffer.clone(),download_complete.clone());
+    // Create the media source stream.
     let mss = MediaSourceStream::new(Box::new(reader), Default::default());
 
+    // Create a probe hint using the file's extension. [Optional]
     let mut hint = Hint::new();
     hint.with_extension("m4a");
+
+    // Use the default options for metadata and format readers.
     let format_opts = FormatOptions::default();
     let metadata_opts = Default::default();
 
-    println!("\x1b[93mProbing format...\x1b[0m");
-    let probed = symphonia::default::get_probe().format(&hint, mss, &format_opts, &metadata_opts)?;
+    // Probe the media source.
+    let probe = symphonia::default::get_probe().format(&hint, mss, &format_opts,&metadata_opts)?;
 
-    let mut format = probed.format;
+    // Get the instantiated format reader.
+    let mut format = probe.format;
 
+    // Find the first audio track with a known (decodeable) codec.
     let track = format
-        .tracks()
+    .tracks()
         .iter()
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
         .ok_or("\x1b[91mNo Audio Tracks Found")?;
@@ -165,150 +124,122 @@ async fn stream(response: reqwest::Response) -> Result<(),Box<dyn std::error::Er
     let decoder_opts = DecoderOptions::default();
     let mut decoder = symphonia::default::get_codecs().make(&codec_params, &decoder_opts)?;
 
-    let host = cpal::default_host();
-    let device = host.default_output_device().ok_or("\x1b[91mNo Output Device Found")?;
+    let mut sample_count = 0;
+    let mut sample_buffer = None;
+    let mut all_samples: Vec<f32> = Vec::new();
 
-    println!("\x1b[92mOutput device: {}\x1b[0m", device.name()?);
-
-    let config = device.default_output_config()?;
-
-    println!("\x1b[92mOutput config: {:?}\x1b[0m", config);
-
-    let sample_rate = codec_params.sample_rate.unwrap_or(48000);
-    let channels = codec_params.channels
-        .unwrap_or(symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT).count();
-
-    let spec = SignalSpec::new(sample_rate, symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
-
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
-
-    std::thread::spawn(move || {
-        let config = cpal::StreamConfig {
-            channels: channels as u16,
-            sample_rate: cpal::SampleRate(sample_rate),
-            buffer_size: cpal::BufferSize::Default,
-        };
-
-        let mut sample_queue: Vec<f32> = Vec::new();
-
-        let stream = device.build_output_stream(&config, move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            let mut idx = 0;
-            while idx < data.len() && !sample_queue.is_empty() {
-                data[idx] = sample_queue.remove(0);
-                idx += 1;
-            }
-
-            while idx < data.len() {
-                if let Ok(samples) = rx.try_recv() {
-                    for sample in samples {
-                        if idx < data.len() {
-                            data[idx] = sample;
-                            idx += 1;
-                        } else {
-                            sample_queue.push(sample);
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            for i in idx..data.len() {
-                data[i] = 0.0;
-            }
-        }, |err| eprintln!("\x1b[91mStream Error: {}\x1b[0m",err),
-            None).unwrap();
-
-        stream.play().unwrap();
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    });
-
-    println!("\x1b[92mPlaying...\x1b[0m");
-
-    let mut sample_buf = None;
-    let mut packet_count = 0;
-
+    // The decode loop.
     loop {
-        let buffer_len = {
-            let buf = buffer.lock().unwrap();
-            buf.len()
-        };
-
-        if buffer_len < 8192 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            continue;
-        }
-
+        // Get the next packet from the media format.
         let packet = match format.next_packet() {
             Ok(packet) => packet,
-            Err(symphonia::core::errors::Error::IoError(e))
-            if e.kind() == std::io::ErrorKind::WouldBlock => {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                continue;
-            }
-            Err(symphonia::core::errors::Error::IoError(e))
-            if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                if download_complete.load(Ordering::Relaxed) {
-                    println!("\x1b[92mEnd of stream\x1b[0m");
-                    break;
-                } else {
-
-                    println!("\x1b[93mWaiting for more data...\x1b[0m");
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                    continue;
-                }
-            }
-            Err(e) => {
-                eprintln!("\x1b[91mFormat error: {}\x1b[0m", e);
+            Err(Error::IoError(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                println!("\n\x1b[92mDecoding complete!\x1b[0m");
                 break;
             }
+            Err(err) => {
+                panic!("{}",err);
+            }
         };
+
+        // Consume any new metadata that has been read since the last packet.
+        while !format.metadata().is_latest() {
+            // Pop the old head of the metadata queue.
+            format.metadata().pop();
+            // Consume the new metadata at the head of the metadata queue.
+        }
 
         if packet.track_id() != track_id {
             continue;
         }
 
-        let decoded = match decoder.decode(&packet) {
-            Ok(decoded) => decoded,
-            Err(e) => {
-                eprintln!("\x1b[91mDecode error: {}\x1b[0m", e);
+        match decoder.decode(&packet) {
+            Ok(_decoded) => {
+                if sample_buffer.is_none() {
+                    let spec = *_decoded.spec();
+                    let duration = _decoded.capacity() as u64;
+
+                    sample_buffer = Some(SampleBuffer::<f32>::new(duration, spec));
+                }
+
+                if let Some(buf) = &mut sample_buffer {
+                    buf.copy_interleaved_ref(_decoded);
+
+                    all_samples.extend_from_slice(buf.samples());
+                    sample_count += buf.samples().len();
+                    println!("\x1b[93m\rDecoded {} samples",sample_count);
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+                }
+            }
+            Err(Error::IoError(_)) => {
+                // The packet failed to decode due to an IO error, skip the packet.
                 continue;
             }
-        };
-
-        if sample_buf.is_none() {
-            sample_buf = Some(SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec()));
-        }
-
-        if let Some(ref mut buf) = sample_buf {
-            buf.copy_interleaved_ref(decoded);
-            let samples = buf.samples().to_vec();
-
-            if tx.send(samples).is_err() {
-                break;
+            Err(Error::DecodeError(_)) => {
+                // The packet failed to decode due to invalid data, skip the packet.
+                continue;
             }
-
-            packet_count += 1;
-            if packet_count % 100 == 0 {
-                println!("\x1b[96mDecode {} packets...\x1b[0m",packet_count);
+            Err(err) => {
+                // An unrecoverable error occured, halt decoding.
+                panic!("{}",err);
             }
         }
     }
-    println!("\x1b[92mFinished Decoding. Total packets decoded: {}\x1b[0m", packet_count);
-    drop(tx);
 
-    let estimated_remaining_secs = (packet_count as f64 * 1024.0) / (sample_rate as f64);
-    println!("\x1b[96mWaiting for audio to finish (~{:.1} seconds)...\x1b[0m", estimated_remaining_secs);
+    println!("\n\x1b[92mTotal samples decoded: {}\x1b[0m", all_samples.len());
 
-    tokio::time::sleep(tokio::time::Duration::from_secs_f64(estimated_remaining_secs + 2.0)).await;
+    let host = cpal::default_host();
+    let device = host.default_output_device().ok_or("\x1b[91mNo Output Device Found")?;
+
+    println!("\x1b[92mOutput device: {}\x1b[0m", device.name()?);
+
+    let sample_rate = codec_params.sample_rate.unwrap_or(48000);
+
+    let channels = codec_params.channels
+    .unwrap_or(symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT).count();
+
+    let cpal_config = cpal::StreamConfig {
+        channels: channels as u16,
+        sample_rate: cpal::SampleRate(sample_rate),
+        buffer_size: cpal::BufferSize::Default,
+    };
+
+    let samples = Arc::new(Mutex::new(all_samples));
+    let mut position = Arc::new(Mutex::new(0_usize));
+    let total_samples = samples.lock().unwrap().len();
+
+    let position_clone = position.clone();
+
+    let stream = device.build_output_stream(&cpal_config, move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+        let mut samples = samples.lock().unwrap();
+        let mut pos = position_clone.lock().unwrap();
+
+        for sample in data.iter_mut() {
+            *sample = if *pos < samples.len() {
+                let s = samples[*pos];
+                *pos += 1;
+                s
+            } else {
+                0.0
+            }
+        }
+    }, 
+        |err| eprintln!("Stream Error: {}",err), None)?;
+
+    stream.play()?;
+    println!("\x1b[92mPlaying audio...\x1b[0m");
+
+    while *position.lock().unwrap() < total_samples {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
     println!("\x1b[92mPlayback complete!\x1b[0m");
     return Ok(());
 }
 
-#[tokio::main]
+#[tokio::main] 
 async fn main() -> Result<(),Box<dyn std::error::Error>> {
     Command::new("clear").status()?;
     println!("\x1b[93mFetching audio URL...\x1b[0m");
@@ -317,7 +248,7 @@ async fn main() -> Result<(),Box<dyn std::error::Error>> {
             "-f",
             "140",
             "-g",
-            &env::args().nth(1).ok_or("Missing Arguments")?
+            &env::args().nth(1).ok_or("\x1b[91mMissing Arguments")?
         ]).output()?;
 
     let url = String::from_utf8(output.stdout)?;
@@ -328,9 +259,18 @@ async fn main() -> Result<(),Box<dyn std::error::Error>> {
 
     println!("\x1b[92mAudio URL Acquired\x1b[0m");
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64)")
+        .build()?;
 
-    let response: reqwest::Response = client.get(&url).send().await?;
+    let response = client.get(&url)
+        .header("Accept", "*/*")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Referer", "https://www.youtube.com/")
+        .header("Range", "bytes=0-")
+        .send()
+    .await?;
+
     if !response.status().is_success() {
         return Err(format!("\x1b[91mHTTP Request Failed With Status: {}", response.status()).into());
     }
@@ -338,11 +278,24 @@ async fn main() -> Result<(),Box<dyn std::error::Error>> {
     println!("\x1b[92mStatus: {}",response.status());
     println!("\x1b[91mHTTP Version: {:?}",response.version());
     println!("\x1b[93mHeaders: {{");
+
     for (key,value) in response.headers().iter() {
         println!("  \x1b[{}m{:?}: {:?}",96,key,value);
     }
-    println!("\x1b[93m}}");
-    stream(response).await?;
 
+    println!("\x1b[93m}}");
+    let start_time = Instant::now();
+
+    let mut audio_stream = response.bytes_stream();
+    let mut reader = StreamingReader::new();
+    let mut buffer: Vec<u8> = Vec::new();
+    while let Some(block) = audio_stream.next().await {
+        reader.buffer.extend_from_slice(&block?);
+    }
+    println!("\x1b[93mFinished fetching all blocks");
+    let elasped = start_time.elapsed();
+    println!("Total Took: {:?}",elasped);
+    println!("\x1b[96mBuffer size: {}",reader.buffer.len());
+    stream(reader).await?;
     return Ok(());
 }
